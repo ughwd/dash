@@ -182,6 +182,14 @@ main { padding: 28px; }
   .topbar { grid-template-columns: 1fr; gap: 12px; }
   .api-key-wrap input { width: 100%; }
 }
+.chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+.chip { background: var(--bg-3); border: 1px solid var(--line); color: var(--fg-dim); font-family: var(--font-mono);
+  font-size: 12px; padding: 6px 12px; cursor: pointer; border-radius: var(--radius); }
+.chip:hover { color: var(--fg); }
+.chip.is-active { background: var(--accent); color: #000; border-color: var(--accent); }
+button.badge { cursor: pointer; color: var(--fg); }
+button.badge:hover { border-color: var(--accent-2); }
+.filter-hint { color: var(--accent-2); font-family: var(--font-mono); font-size: 11px; min-height: 14px; }
 </style>
 </head>
 <body>
@@ -196,7 +204,7 @@ main { padding: 28px; }
     <span class="search-hint">↵</span>
   </div>
   <div class="api-key-wrap">
-    <input id="apiKey" type="password" placeholder="TMDB API key (v3)" />
+    <input id="apiKey" type="password" placeholder="TMDB API key (v3) или токен v4" />
     <button id="saveKey" class="btn btn-ghost">OK</button>
   </div>
 </header>
@@ -215,19 +223,19 @@ main { padding: 28px; }
 
   <section id="tab-overview" class="tab-panel is-active">
     <div class="kpi-row">
-      <div class="kpi"><div class="kpi-value" id="kpiTotal">—</div><div class="kpi-label">Фильмов в базе</div></div>
-      <div class="kpi"><div class="kpi-value" id="kpiRating">—</div><div class="kpi-label">Средний рейтинг</div></div>
-      <div class="kpi"><div class="kpi-value" id="kpiYears">—</div><div class="kpi-label">Диапазон лет</div></div>
+      <div class="kpi"><div class="kpi-value" id="kpiTotal">—</div><div class="kpi-label">Фильмов в каталоге (≥50 голосов)</div></div>
+      <div class="kpi"><div class="kpi-value" id="kpiRating">—</div><div class="kpi-label">Ср. рейтинг популярных</div></div>
+      <div class="kpi"><div class="kpi-value" id="kpiNow">—</div><div class="kpi-label">Сейчас в прокате</div></div>
       <div class="kpi"><div class="kpi-value" id="kpiGenres">—</div><div class="kpi-label">Жанров</div></div>
     </div>
 
     <div class="grid-2">
       <div class="panel">
-        <h3 class="panel-title">Фильмы по десятилетиям</h3>
+        <h3 class="panel-title">Фильмы по десятилетиям (≥50 голосов)</h3>
         <div class="canvas-wrap"><canvas id="chartDecades"></canvas></div>
       </div>
       <div class="panel">
-        <h3 class="panel-title">Распределение по жанрам</h3>
+        <h3 class="panel-title">Топ-10 жанров (жанры пересекаются)</h3>
         <div class="canvas-wrap"><canvas id="chartGenres"></canvas></div>
       </div>
     </div>
@@ -238,7 +246,13 @@ main { padding: 28px; }
     </div>
 
     <div class="panel">
-      <h3 class="panel-title">Популярные сейчас</h3>
+      <h3 class="panel-title">Подборки</h3>
+      <div class="chips" id="listChips">
+        <button class="chip is-active" data-list="trending">В тренде</button>
+        <button class="chip" data-list="now_playing" data-live>В прокате</button>
+        <button class="chip" data-list="upcoming" data-live>Скоро</button>
+        <button class="chip" data-list="top_rated">Лучшие</button>
+      </div>
       <div class="card-grid" id="popularGrid"><div class="loading">Загрузка…</div></div>
     </div>
   </section>
@@ -266,8 +280,9 @@ main { padding: 28px; }
         <span>Страна</span>
         <select id="filterCountry"><option value="">Все</option></select>
       </label>
+      <div id="filterHint" class="filter-hint"></div>
       <div class="filter-actions">
-        <button id="applyFilters" class="btn btn-primary">Применить</button>
+        
         <button id="resetFilters" class="btn btn-ghost">Сброс</button>
       </div>
     </aside>
@@ -293,6 +308,7 @@ main { padding: 28px; }
   <section id="tab-analytics" class="tab-panel">
     <div class="panel">
       <h3 class="panel-title">Распределение рейтингов</h3>
+      <p id="analyticsNote" class="results-count" style="margin-bottom:16px"></p>
       <div class="canvas-wrap"><canvas id="chartRatings"></canvas></div>
     </div>
     <div class="panel">
@@ -378,56 +394,87 @@ function escapeHtml(s) {
   })[c]);
 }
 
-/* ---------- FETCH ---------- */
+/* ---------- FETCH (кэш + ограничение параллельных запросов) ---------- */
+const MIN_VOTES = 50;              // отсекаем "мусорные" фильмы почти без голосов
+const LISTS = { trending: '/trending/movie/week', now_playing: '/movie/now_playing', upcoming: '/movie/upcoming', top_rated: '/movie/top_rated' };
+const DEFAULT_FILTERS = () => ({ genre: '', yearFrom: '', yearTo: '', rating: 0, country: '', sort: 'popularity.desc', page: 1 });
+Object.assign(state, { reqId: 0, searchPage: 1, list: 'trending' });
+
+const cache = new Map();
+const queue = [];
+let running = 0;
+function limited(fn) {
+  return new Promise((res, rej) => {
+    const run = () => { running++; fn().then(res, rej).finally(() => { running--; queue.length && queue.shift()(); }); };
+    running < 6 ? run() : queue.push(run);
+  });
+}
 async function tmdb(path, params = {}) {
   if (!API_KEY) throw new Error('NO_API_KEY');
   const url = new URL(TMDB_BASE + path);
-  url.searchParams.set('api_key', API_KEY);
+  const isToken = API_KEY.length > 40;               // v4 Bearer-токен или v3 ключ
+  if (!isToken) url.searchParams.set('api_key', API_KEY);
   url.searchParams.set('language', 'ru-RU');
   Object.entries(params).forEach(([k, v]) => {
     if (v !== '' && v !== null && v !== undefined) url.searchParams.set(k, v);
   });
-  const res = await fetch(url.toString());
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`TMDB ${res.status}: ${text.slice(0, 120)}`);
-  }
-  return res.json();
+  const key = url.toString();
+  if (cache.has(key)) return cache.get(key);
+  const p = limited(async () => {
+    const res = await fetch(key, isToken ? { headers: { Authorization: 'Bearer ' + API_KEY } } : undefined);
+    if (!res.ok) throw new Error(`TMDB ${res.status}`);
+    return res.json();
+  });
+  cache.set(key, p);
+  p.catch(() => cache.delete(key));
+  return p;
 }
 
 /* =========================================================
    DEMO DATA — если нет ключа
    ========================================================= */
 const DEMO_MOVIES = [
-  { id: 1, title: 'Крёстный отец', original_title: 'The Godfather', release_date: '1972-03-14', vote_average: 8.7, vote_count: 19000, poster_path: null, genre_ids: [18, 80], overview: 'История семьи Корлеоне.', popularity: 120 },
-  { id: 2, title: 'Побег из Шоушенка', original_title: 'The Shawshank Redemption', release_date: '1994-09-23', vote_average: 8.7, vote_count: 25000, poster_path: null, genre_ids: [18, 80], overview: 'История надежды в тюрьме.', popularity: 140 },
-  { id: 3, title: 'Тёмный рыцарь', original_title: 'The Dark Knight', release_date: '2008-07-16', vote_average: 8.5, vote_count: 31000, poster_path: null, genre_ids: [28, 80, 18], overview: 'Бэтмен против Джокера.', popularity: 200 },
-  { id: 4, title: 'Криминальное чтиво', original_title: 'Pulp Fiction', release_date: '1994-09-10', vote_average: 8.5, vote_count: 26000, poster_path: null, genre_ids: [80, 18], overview: 'Несколько переплетённых историй.', popularity: 180 },
-  { id: 5, title: 'Форрест Гамп', original_title: 'Forrest Gump', release_date: '1994-07-06', vote_average: 8.5, vote_count: 24000, poster_path: null, genre_ids: [35, 18, 10749], overview: 'Жизнь простого человека.', popularity: 160 },
-  { id: 6, title: 'Начало', original_title: 'Inception', release_date: '2010-07-16', vote_average: 8.4, vote_count: 34000, poster_path: null, genre_ids: [28, 878, 53], overview: 'Сон внутри сна.', popularity: 250 },
-  { id: 7, title: 'Матрица', original_title: 'The Matrix', release_date: '1999-03-31', vote_average: 8.2, vote_count: 24000, poster_path: null, genre_ids: [28, 878], overview: 'Реальность — симуляция.', popularity: 210 },
-  { id: 8, title: 'Интерстеллар', original_title: 'Interstellar', release_date: '2014-11-07', vote_average: 8.5, vote_count: 33000, poster_path: null, genre_ids: [12, 18, 878], overview: 'Космическая одиссея.', popularity: 220 },
-  { id: 9, title: 'Бойцовский клуб', original_title: 'Fight Club', release_date: '1999-10-15', vote_average: 8.4, vote_count: 28000, poster_path: null, genre_ids: [18, 53], overview: 'Первый и второй правила бойцовского клуба.', popularity: 190 },
-  { id: 10, title: 'Гладиатор', original_title: 'Gladiator', release_date: '2000-05-05', vote_average: 8.2, vote_count: 17000, poster_path: null, genre_ids: [28, 18, 12], overview: 'Месть римского генерала.', popularity: 130 },
-  { id: 11, title: 'Паразиты', original_title: 'Parasite', release_date: '2019-05-30', vote_average: 8.5, vote_count: 18000, poster_path: null, genre_ids: [18, 53], overview: 'Классовое неравенство.', popularity: 170 },
-  { id: 12, title: 'Джокер', original_title: 'Joker', release_date: '2019-10-04', vote_average: 8.2, vote_count: 25000, poster_path: null, genre_ids: [18, 80, 53], overview: 'Происхождение Джокера.', popularity: 230 }
-];
+  [1,'Крёстный отец','The Godfather','1972-03-14',8.7,19000,[18,80],'US',120,'История семьи Корлеоне.'],
+  [2,'Побег из Шоушенка','The Shawshank Redemption','1994-09-23',8.7,25000,[18,80],'US',140,'История надежды в тюрьме.'],
+  [3,'Тёмный рыцарь','The Dark Knight','2008-07-16',8.5,31000,[28,80,18],'US',200,'Бэтмен против Джокера.'],
+  [4,'Криминальное чтиво','Pulp Fiction','1994-09-10',8.5,26000,[80,18],'US',180,'Несколько переплетённых историй.'],
+  [5,'Форрест Гамп','Forrest Gump','1994-07-06',8.5,24000,[35,18,10749],'US',160,'Жизнь простого человека.'],
+  [6,'Начало','Inception','2010-07-16',8.4,34000,[28,878,53],'US',250,'Сон внутри сна.'],
+  [7,'Матрица','The Matrix','1999-03-31',8.2,24000,[28,878],'US',210,'Реальность — симуляция.'],
+  [8,'Интерстеллар','Interstellar','2014-11-07',8.5,33000,[12,18,878],'US',220,'Космическая одиссея.'],
+  [9,'Бойцовский клуб','Fight Club','1999-10-15',8.4,28000,[18,53],'US',190,'Анархия и подпольные бои.'],
+  [10,'Гладиатор','Gladiator','2000-05-05',8.2,17000,[28,18,12],'US',130,'Месть римского генерала.'],
+  [11,'Паразиты','Parasite','2019-05-30',8.5,18000,[18,53],'KR',170,'Классовое неравенство.'],
+  [12,'Джокер','Joker','2019-10-04',8.2,25000,[18,80,53],'US',230,'Происхождение Джокера.'],
+  [13,'Амели','Amélie','2001-04-25',7.9,12000,[35,10749],'FR',90,'Парижанка меняет жизнь вокруг.'],
+  [14,'Унесённые призраками','千と千尋の神隠し','2001-07-20',8.5,15000,[16,14,10751],'JP',150,'Девочка в мире духов.'],
+  [15,'Жизнь прекрасна','La vita è bella','1997-12-20',8.5,12500,[35,18,10749],'IT',100,'Отец защищает сына в лагере.'],
+  [16,'Брат','Брат','1997-05-17',8.0,2500,[80,18],'RU',60,'Данила Багров в Петербурге.']
+].map(([id,title,original_title,release_date,vote_average,vote_count,genre_ids,country,popularity,overview]) =>
+  ({ id, title, original_title, release_date, vote_average, vote_count, poster_path: null, genre_ids, country, popularity, overview }));
 
-function demoDiscoverResponse() {
-  const f = state.filters;
-  let list = [...DEMO_MOVIES];
-  if (f.genre) {
-    const gid = Number(f.genre);
-    list = list.filter(m => m.genre_ids.includes(gid));
-  }
-  if (f.yearFrom) list = list.filter(m => Number(m.release_date.slice(0,4)) >= Number(f.yearFrom));
-  if (f.yearTo)   list = list.filter(m => Number(m.release_date.slice(0,4)) <= Number(f.yearTo));
-  if (Number(f.rating) > 0) list = list.filter(m => m.vote_average >= Number(f.rating));
-  if (f.sort === 'vote_average.desc') list.sort((a,b) => b.vote_average - a.vote_average);
-  else if (f.sort === 'primary_release_date.desc') list.sort((a,b) => b.release_date.localeCompare(a.release_date));
-  else if (f.sort === 'primary_release_date.asc')  list.sort((a,b) => a.release_date.localeCompare(b.release_date));
-  else list.sort((a,b) => b.popularity - a.popularity);
-  return { results: list, total_results: list.length, total_pages: 1, page: 1 };
+function demoFilter() {
+  const f = state.filters, y = m => +m.release_date.slice(0, 4);
+  const sorts = {
+    'vote_average.desc': (a, b) => b.vote_average - a.vote_average,
+    'primary_release_date.desc': (a, b) => b.release_date.localeCompare(a.release_date),
+    'primary_release_date.asc': (a, b) => a.release_date.localeCompare(b.release_date)
+  };
+  return DEMO_MOVIES.filter(m =>
+    (!f.genre || m.genre_ids.includes(+f.genre)) && (!f.country || m.country === f.country) &&
+    (!f.yearFrom || y(m) >= +f.yearFrom) && (!f.yearTo || y(m) <= +f.yearTo) && m.vote_average >= f.rating
+  ).sort(sorts[f.sort] || ((a, b) => b.popularity - a.popularity));
+}
+
+function demoOverviewCharts() {
+  const D = DEMO_MOVIES;
+  const tally = keys => { const c = {}; keys.forEach(k => c[k] = (c[k] || 0) + 1); return Object.entries(c).sort((a, b) => b[1] - a[1]); };
+  const dec = tally(D.map(m => Math.floor(+m.release_date.slice(0, 4) / 10) * 10)).sort((a, b) => a[0] - b[0]);
+  drawBar('chartDecades', dec.map(d => d[0] + 's'), dec.map(d => d[1]), 'Фильмов');
+  const g = tally(D.flatMap(m => m.genre_ids)).slice(0, 10);
+  drawDoughnut('chartGenres', g.map(x => genreName(+x[0])), g.map(x => x[1]));
+  const c = tally(D.map(m => m.country)).slice(0, 10);
+  drawBar('chartCountries', c.map(x => countryName(x[0])), c.map(x => x[1]), 'Фильмов', true);
 }
 
 /* =========================================================
@@ -437,56 +484,27 @@ document.addEventListener('DOMContentLoaded', init);
 
 async function init() {
   bindUI();
-
-  if (!API_KEY) {
-    DEMO_MODE = true;
-    $('#apiKey').value = '';
-    showStatus('ДЕМО-РЕЖИМ: показываю примерные данные. Введите TMDB API key (v3) справа сверху и нажмите OK для реальных данных.', 'info');
-    renderDemoAll();
-    return;
-  }
-
+  if (!API_KEY) return enterDemo('ДЕМО-РЕЖИМ: показываю примерные данные. Введите TMDB API key справа сверху и нажмите OK для реальных данных.');
   $('#apiKey').value = API_KEY;
   DEMO_MODE = false;
   await bootstrap();
 }
 
-function renderDemoAll() {
-  // KPI
-  $('#kpiTotal').textContent = DEMO_MOVIES.length.toString();
-  const avg = DEMO_MOVIES.reduce((s,m)=>s+m.vote_average,0) / DEMO_MOVIES.length;
-  $('#kpiRating').textContent = avg.toFixed(1);
-  const years = DEMO_MOVIES.map(m => Number(m.release_date.slice(0,4)));
-  $('#kpiYears').textContent = `${Math.min(...years)}–${Math.max(...years)}`;
-  $('#kpiGenres').textContent = state.genres.length;
-
-  // Populates
+function enterDemo(msg) {
+  DEMO_MODE = true;
+  showStatus(msg, 'info');
   populateSelects();
-
-  // Overview charts (демо)
-  drawBar('chartDecades',
-    ['1950s','1960s','1970s','1980s','1990s','2000s','2010s','2020s'],
-    [1200, 1800, 2400, 3200, 4100, 5200, 6800, 2400], 'Фильмов');
-
-  drawDoughnut('chartGenres',
-    state.genres.slice(0,10).map(g => g.name),
-    [8200, 3400, 2100, 5400, 2800, 900, 7100, 1600, 1300, 700]);
-
-  drawBar('chartCountries',
-    state.countries.slice(0,10).map(c => c.name),
-    [18000, 4200, 3800, 3100, 2200, 1900, 2800, 1500, 1400, 2400, 1800, 900, 800, 600],
-    'Фильмов', true);
-
-  // Popular grid
-  const grid = $('#popularGrid');
-  grid.innerHTML = DEMO_MOVIES.slice(0, 12).map(movieCardHTML).join('');
-  attachCardClicks(grid);
-
-  // Discover
+  syncInputs();
+  const D = DEMO_MOVIES;
+  $('#kpiTotal').textContent = D.length;
+  $('#kpiRating').textContent = (D.reduce((s, m) => s + m.vote_average, 0) / D.length).toFixed(1);
+  $('#kpiNow').textContent = '—';
+  $('#kpiGenres').textContent = state.genres.length;
+  $$('#listChips [data-live]').forEach(c => c.hidden = true);
+  demoOverviewCharts();
+  renderList('trending');
   renderDiscover();
-
-  // Analytics (демо)
-  drawDemoAnalytics();
+  renderFiltersStrip();
 }
 
 async function bootstrap() {
@@ -494,94 +512,97 @@ async function bootstrap() {
     showStatus('Загружаю данные…', 'info');
     await loadGenres();
     populateSelects();
+    syncInputs();
     $('#kpiGenres').textContent = state.genres.length;
-
-    await renderOverview();
-    await renderDiscover();
+    $$('#listChips [data-live]').forEach(c => c.hidden = false);
+    await Promise.all([renderOverview(), renderDiscover()]);
     renderFiltersStrip();
     showStatus('Данные загружены', 'ok');
   } catch (e) {
     console.error(e);
-    if (e.message === 'NO_API_KEY') showStatus('Введите API key', 'info');
-    else if (e.message.includes('401')) showStatus('Неверный API key (401). Проверьте ключ.', 'info');
-    else showStatus('Ошибка: ' + e.message, 'info');
-    // fallback — демо
-    DEMO_MODE = true;
-    renderDemoAll();
+    let msg = 'Ошибка: ' + e.message;
+    if (e.message.includes('401')) {
+      API_KEY = ''; localStorage.removeItem('tmdb_key'); $('#apiKey').value = '';
+      msg = 'Неверный API key (401). Ключ сброшен, показываю демо.';
+    }
+    enterDemo(msg);
+    showStatus(msg, 'error');
   }
+}
+
+function switchTab(name) {
+  $$('.tab').forEach(x => x.classList.toggle('is-active', x.dataset.tab === name));
+  $$('.tab-panel').forEach(x => x.classList.toggle('is-active', x.id === 'tab-' + name));
+  if (name === 'analytics') renderAnalytics();
+}
+
+/* фильтры применяются сразу (с небольшой задержкой), без кнопки "Применить" */
+const applyLive = debounce(() => { state.filters.page = 1; renderDiscover(); renderFiltersStrip(); }, 350);
+
+function cleanYear(v) { const n = parseInt(v, 10); return String(v).length === 4 && n >= 1888 && n <= 2100 ? String(n) : ''; }
+
+function readFilters() {
+  const f = state.filters;
+  f.genre = $('#filterGenre').value;
+  f.country = $('#filterCountry').value;
+  f.rating = Number($('#filterRating').value);
+  f.sort = $('#sortBy').value;
+  f.yearFrom = cleanYear($('#filterYearFrom').value);
+  f.yearTo = cleanYear($('#filterYearTo').value);
+  $('#ratingOut').value = f.rating;
+  // фильтры и поиск взаимоисключающие: меняем фильтр — выходим из режима поиска
+  state.searchQuery = ''; $('#globalSearch').value = '';
+}
+
+function syncInputs() {
+  const f = state.filters;
+  $('#filterGenre').value = f.genre; $('#filterCountry').value = f.country;
+  $('#filterYearFrom').value = f.yearFrom; $('#filterYearTo').value = f.yearTo;
+  $('#filterRating').value = f.rating; $('#ratingOut').value = f.rating;
+  $('#sortBy').value = f.sort;
 }
 
 function bindUI() {
   $('#saveKey').addEventListener('click', async () => {
     const v = $('#apiKey').value.trim();
-    if (!v) { showStatus('Пустой ключ', 'info'); return; }
-    API_KEY = v;
+    if (!v) {
+      API_KEY = ''; localStorage.removeItem('tmdb_key'); cache.clear();
+      return enterDemo('Ключ удалён. Демо-режим.');
+    }
+    API_KEY = v; cache.clear();
     localStorage.setItem('tmdb_key', v);
     DEMO_MODE = false;
-    showStatus('Проверяю ключ…', 'info');
     await bootstrap();
   });
 
-  $$('.tab').forEach(t => t.addEventListener('click', () => {
-    $$('.tab').forEach(x => x.classList.remove('is-active'));
-    $$('.tab-panel').forEach(x => x.classList.remove('is-active'));
-    t.classList.add('is-active');
-    $('#tab-' + t.dataset.tab).classList.add('is-active');
-    if (t.dataset.tab === 'analytics') renderAnalytics();
-  }));
+  $$('.tab').forEach(t => t.addEventListener('click', () => switchTab(t.dataset.tab)));
+  $$('#listChips .chip').forEach(c => c.addEventListener('click', () => renderList(c.dataset.list)));
 
   const search = $('#globalSearch');
-  search.addEventListener('input', debounce(async (e) => {
-    state.searchQuery = e.target.value.trim();
-    if (!state.searchQuery) { await renderDiscover(); return; }
-    await runSearch(state.searchQuery);
-  }, 500));
+  const doSearch = () => {
+    state.searchQuery = search.value.trim();
+    state.searchPage = 1;
+    if (state.searchQuery) switchTab('discover');
+    renderDiscover(); renderFiltersStrip();
+  };
+  search.addEventListener('input', debounce(doSearch, 500));
+  search.addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(); });
 
-  $('#filterGenre').addEventListener('change', e => state.filters.genre = e.target.value);
-  $('#filterYearFrom').addEventListener('input', e => state.filters.yearFrom = e.target.value);
-  $('#filterYearTo').addEventListener('input', e => state.filters.yearTo = e.target.value);
-  $('#filterRating').addEventListener('input', e => {
-    state.filters.rating = e.target.value;
-    $('#ratingOut').value = e.target.value;
-  });
-  $('#filterCountry').addEventListener('change', e => state.filters.country = e.target.value);
-  $('#sortBy').addEventListener('change', e => {
-    state.filters.sort = e.target.value;
-    state.filters.page = 1;
-    if (!state.searchQuery) renderDiscover();
-  });
-
-  $('#applyFilters').addEventListener('click', () => {
-    state.filters.page = 1;
-    state.searchQuery = '';
-    $('#globalSearch').value = '';
-    renderDiscover();
-    renderFiltersStrip();
-  });
+  ['#filterGenre', '#filterCountry', '#sortBy', '#filterYearFrom', '#filterYearTo', '#filterRating'].forEach(sel =>
+    $(sel).addEventListener(sel.includes('Year') || sel.includes('Rating') ? 'input' : 'change', () => { readFilters(); applyLive(); }));
 
   $('#resetFilters').addEventListener('click', () => {
-    state.filters = { genre: '', yearFrom: '', yearTo: '', rating: 0, country: '', sort: 'popularity.desc', page: 1 };
-    $('#filterGenre').value = '';
-    $('#filterYearFrom').value = '';
-    $('#filterYearTo').value = '';
-    $('#filterRating').value = 0;
-    $('#ratingOut').value = 0;
-    $('#filterCountry').value = '';
-    $('#sortBy').value = 'popularity.desc';
-    renderDiscover();
-    renderFiltersStrip();
+    state.filters = DEFAULT_FILTERS();
+    state.searchQuery = ''; $('#globalSearch').value = '';
+    syncInputs(); renderDiscover(); renderFiltersStrip();
   });
 
-  $('#modal').addEventListener('click', e => {
-    if (e.target.dataset.close !== undefined) closeModal();
-  });
-  document.addEventListener('keydown', e => {
-    if (e.key === 'Escape') closeModal();
-  });
+  $('#modal').addEventListener('click', e => { if (e.target.dataset.close !== undefined) closeModal(); });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
 }
 
 /* =========================================================
-   GENRES
+   GENRES / COUNTRIES
    ========================================================= */
 async function loadGenres() {
   const data = await tmdb('/genre/movie/list');
@@ -589,36 +610,30 @@ async function loadGenres() {
 }
 
 function populateSelects() {
-  const sel = $('#filterGenre');
-  sel.innerHTML = '<option value="">Все</option>' +
+  $('#filterGenre').innerHTML = '<option value="">Все</option>' +
     state.genres.map(g => `<option value="${g.id}">${escapeHtml(g.name)}</option>`).join('');
-
-  const csel = $('#filterCountry');
-  csel.innerHTML = '<option value="">Все</option>' +
+  $('#filterCountry').innerHTML = '<option value="">Все</option>' +
     state.countries.map(c => `<option value="${c.code}">${escapeHtml(c.name)}</option>`).join('');
 }
 
-function genreName(id) {
-  const g = state.genres.find(x => x.id === id);
-  return g ? g.name : '';
-}
+function genreName(id) { const g = state.genres.find(x => x.id === id); return g ? g.name : ''; }
+function countryName(code) { const c = state.countries.find(x => x.code === code); return c ? c.name : code; }
 
 /* =========================================================
    CARDS
    ========================================================= */
 function movieCardHTML(m) {
   const poster = posterUrl(m.poster_path, 'w342');
-  const rating = Number(m.vote_average || 0).toFixed(1);
+  const hasRating = m.vote_average > 0;
   const year = (m.release_date || '').slice(0, 4) || '—';
-  const genres = (m.genre_ids || []).slice(0, 3).map(id =>
-    `<span class="genre-tag">${escapeHtml(genreName(id))}</span>`
-  ).join('');
+  const genres = (m.genre_ids || []).slice(0, 3).map(genreName).filter(Boolean)
+    .map(n => `<span class="genre-tag">${escapeHtml(n)}</span>`).join('');
   return `
     <div class="movie-card" data-id="${m.id}">
       <div class="movie-poster">
         ${poster ? `<img loading="lazy" src="${poster}" alt="${escapeHtml(m.title)}">`
-                 : `<div class="no-poster">${escapeHtml((m.title || '').slice(0,40))}</div>`}
-        <div class="movie-rating ${ratingClass(m.vote_average)}">${rating}</div>
+                 : `<div class="no-poster">${escapeHtml((m.title || '').slice(0, 40))}</div>`}
+        <div class="movie-rating ${hasRating ? ratingClass(m.vote_average) : 'mid'}">${hasRating ? m.vote_average.toFixed(1) : '—'}</div>
       </div>
       <div class="movie-body">
         <div class="movie-title">${escapeHtml(m.title)}</div>
@@ -629,238 +644,199 @@ function movieCardHTML(m) {
 }
 
 function attachCardClicks(container) {
-  container.querySelectorAll('.movie-card').forEach(card => {
-    card.addEventListener('click', () => openMovie(Number(card.dataset.id)));
-  });
+  container.querySelectorAll('.movie-card').forEach(card =>
+    card.addEventListener('click', () => openMovie(Number(card.dataset.id))));
 }
 
 /* =========================================================
    OVERVIEW
    ========================================================= */
+const todayISO = () => new Date().toISOString().slice(0, 10);
+const countMovies = (params) =>
+  tmdb('/discover/movie', { 'vote_count.gte': MIN_VOTES, ...params }).then(r => r.total_results).catch(() => 0);
+
 async function renderOverview() {
-  const pop = await tmdb('/movie/popular', { page: 1 });
-  $('#kpiTotal').textContent = (pop.total_results || 0).toLocaleString('ru-RU');
-  const avg = pop.results.length ? pop.results.reduce((s,m)=>s+(m.vote_average||0),0) / pop.results.length : 0;
-  $('#kpiRating').textContent = avg.toFixed(1);
-  const years = pop.results.map(m => Number((m.release_date||'').slice(0,4))).filter(Boolean);
-  if (years.length) $('#kpiYears').textContent = `${Math.min(...years)}–${Math.max(...years)}`;
+  const base = { 'vote_count.gte': MIN_VOTES, sort_by: 'popularity.desc' };
+  const [total, now, ...pages] = await Promise.all([
+    tmdb('/discover/movie', base),
+    tmdb('/movie/now_playing'),
+    ...[1, 2, 3].map(p => tmdb('/discover/movie', { ...base, page: p }))
+  ]);
+  const top = pages.flatMap(r => r.results || []);
+  $('#kpiTotal').textContent = (total.total_results || 0).toLocaleString('ru-RU');
+  $('#kpiNow').textContent = (now.total_results || 0).toLocaleString('ru-RU');
+  $('#kpiRating').textContent = top.length ? (top.reduce((s, m) => s + (m.vote_average || 0), 0) / top.length).toFixed(1) : '—';
 
+  renderList(state.list);
+  renderDecadesChart().catch(console.error);
+  renderGenresChart().catch(console.error);
+  renderCountriesChart().catch(console.error);
+}
+
+async function renderList(name) {
+  state.list = name;
+  $$('#listChips .chip').forEach(c => c.classList.toggle('is-active', c.dataset.list === name));
   const grid = $('#popularGrid');
-  grid.innerHTML = pop.results.slice(0, 12).map(movieCardHTML).join('');
-  attachCardClicks(grid);
-
-  renderDecadesChart().catch(e => console.error(e));
-  renderGenresChart().catch(e => console.error(e));
-  renderCountriesChart().catch(e => console.error(e));
+  grid.innerHTML = '<div class="loading">Загрузка…</div>';
+  try {
+    const res = DEMO_MODE
+      ? [...DEMO_MOVIES].sort(name === 'top_rated' ? (a, b) => b.vote_average - a.vote_average : (a, b) => b.popularity - a.popularity)
+      : (await tmdb(LISTS[name])).results;
+    grid.innerHTML = res.slice(0, 12).map(movieCardHTML).join('') || '<div class="empty">Пусто</div>';
+    attachCardClicks(grid);
+  } catch (e) {
+    console.error(e);
+    grid.innerHTML = '<div class="empty">Не удалось загрузить подборку</div>';
+  }
 }
 
 async function renderDecadesChart() {
-  const decades = [
-    { label: '1950s', from: '1950-01-01', to: '1959-12-31' },
-    { label: '1960s', from: '1960-01-01', to: '1969-12-31' },
-    { label: '1970s', from: '1970-01-01', to: '1979-12-31' },
-    { label: '1980s', from: '1980-01-01', to: '1989-12-31' },
-    { label: '1990s', from: '1990-01-01', to: '1999-12-31' },
-    { label: '2000s', from: '2000-01-01', to: '2009-12-31' },
-    { label: '2010s', from: '2010-01-01', to: '2019-12-31' },
-    { label: '2020s', from: '2020-01-01', to: '2029-12-31' },
-  ];
-  const counts = await Promise.all(decades.map(d =>
-    tmdb('/discover/movie', {
-      'primary_release_date.gte': d.from, 'primary_release_date.lte': d.to, page: 1
-    }).then(r => r.total_results).catch(() => 0)
-  ));
+  const today = todayISO(), last = new Date().getFullYear();
+  const decades = [];
+  for (let d = 1950; d <= last; d += 10) decades.push({ label: d + 's', from: `${d}-01-01`, to: `${d + 9}-12-31` < today ? `${d + 9}-12-31` : today });
+  const counts = await Promise.all(decades.map(d => countMovies({ 'primary_release_date.gte': d.from, 'primary_release_date.lte': d.to })));
   drawBar('chartDecades', decades.map(d => d.label), counts, 'Фильмов');
 }
 
 async function renderGenresChart() {
-  const top = state.genres.slice(0, 10);
-  const counts = await Promise.all(top.map(g =>
-    tmdb('/discover/movie', { with_genres: g.id, page: 1 })
-      .then(r => r.total_results).catch(() => 0)
-  ));
-  drawDoughnut('chartGenres', top.map(g => g.name), counts);
+  const all = await Promise.all(state.genres.map(g => countMovies({ with_genres: g.id }).then(n => [g.name, n])));
+  const top = all.sort((a, b) => b[1] - a[1]).slice(0, 10);
+  drawDoughnut('chartGenres', top.map(x => x[0]), top.map(x => x[1]));
 }
 
 async function renderCountriesChart() {
-  const top = state.countries.slice(0, 10);
-  const counts = await Promise.all(top.map(c =>
-    tmdb('/discover/movie', { with_origin_country: c.code, page: 1 })
-      .then(r => r.total_results).catch(() => 0)
-  ));
-  drawBar('chartCountries', top.map(c => c.name), counts, 'Фильмов', true);
+  const all = await Promise.all(state.countries.map(c => countMovies({ with_origin_country: c.code }).then(n => [c.name, n])));
+  const top = all.sort((a, b) => b[1] - a[1]).slice(0, 10);
+  drawBar('chartCountries', top.map(x => x[0]), top.map(x => x[1]), 'Фильмов', true);
 }
 
 /* =========================================================
-   DISCOVER
+   DISCOVER + ПОИСК
    ========================================================= */
-async function renderDiscover() {
-  let data;
-  if (DEMO_MODE) {
-    data = demoDiscoverResponse();
-  } else {
-    try {
-      data = await tmdb('/discover/movie', buildDiscoverParams());
-    } catch (e) {
-      console.error('discover', e);
-      $('#discoverGrid').innerHTML = '<div class="empty">Ошибка запроса: ' + escapeHtml(e.message) + '</div>';
-      return;
-    }
-  }
-
-  state.discoverTotalPages = Math.min(data.total_pages || 1, 500);
-  $('#resultsCount').innerHTML =
-    `Найдено: <b>${(data.total_results || 0).toLocaleString('ru-RU')}</b> фильмов · страница <b>${data.page||1}</b> из <b>${state.discoverTotalPages}</b>`;
-
-  const grid = $('#discoverGrid');
-  if (!data.results || !data.results.length) {
-    grid.innerHTML = '<div class="empty">Ничего не найдено</div>';
-  } else {
-    grid.innerHTML = data.results.map(movieCardHTML).join('');
-    attachCardClicks(grid);
-  }
-  renderPagination();
-}
-
-function buildDiscoverParams() {
+function buildDiscoverParams(page = state.filters.page) {
   const f = state.filters;
-  const p = { sort_by: f.sort, page: f.page };
+  // при сортировке по рейтингу нужен высокий порог голосов, иначе вверху будут фильмы с 1-2 оценками
+  const p = { sort_by: f.sort, page, 'vote_count.gte': f.sort === 'vote_average.desc' ? 300 : MIN_VOTES };
   if (f.genre) p.with_genres = f.genre;
   if (f.yearFrom) p['primary_release_date.gte'] = `${f.yearFrom}-01-01`;
-  if (f.yearTo)   p['primary_release_date.lte'] = `${f.yearTo}-12-31`;
-  if (Number(f.rating) > 0) p['vote_average.gte'] = f.rating;
+  if (f.yearTo) p['primary_release_date.lte'] = `${f.yearTo}-12-31`;
+  else if (f.sort.startsWith('primary_release_date')) p['primary_release_date.lte'] = todayISO(); // без ещё не вышедших
+  if (f.rating > 0) p['vote_average.gte'] = f.rating;
   if (f.country) p.with_origin_country = f.country;
   return p;
 }
 
-function renderPagination() {
-  const cont = $('#pagination');
-  const total = state.discoverTotalPages;
-  const cur = state.filters.page;
-  if (total <= 1) { cont.innerHTML = ''; return; }
+async function renderDiscover() {
+  const f = state.filters, q = state.searchQuery;
+  const page = q ? state.searchPage : f.page;
+  const my = ++state.reqId;                       // защита от гонки ответов
+  const grid = $('#discoverGrid');
 
-  const pages = new Set([1, total, cur, cur-1, cur+1, cur-2, cur+2]);
-  const list = [...pages].filter(p => p >= 1 && p <= total).sort((a,b)=>a-b);
+  const bad = !q && f.yearFrom && f.yearTo && +f.yearFrom > +f.yearTo;
+  $('#filterHint').textContent = bad ? 'Год «от» больше года «до»' : '';
+  if (bad) { grid.innerHTML = '<div class="empty">Проверьте диапазон лет</div>'; $('#pagination').innerHTML = ''; return; }
 
-  let html = `<button data-page="${cur-1}" ${cur===1?'disabled':''}>←</button>`;
-  let prev = 0;
-  for (const p of list) {
-    if (p - prev > 1) html += `<button disabled>…</button>`;
-    html += `<button data-page="${p}" class="${p===cur?'is-active':''}">${p}</button>`;
-    prev = p;
-  }
-  html += `<button data-page="${cur+1}" ${cur===total?'disabled':''}>→</button>`;
-  cont.innerHTML = html;
-
-  cont.querySelectorAll('button[data-page]').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const p = Number(btn.dataset.page);
-      if (!p || p < 1 || p > total) return;
-      state.filters.page = p;
-      renderDiscover();
-      window.scrollTo({ top: 0, behavior: 'smooth' });
-    });
-  });
-}
-
-async function runSearch(q) {
-  if (DEMO_MODE) {
-    const lower = q.toLowerCase();
-    const filtered = DEMO_MOVIES.filter(m =>
-      m.title.toLowerCase().includes(lower) ||
-      (m.original_title || '').toLowerCase().includes(lower)
-    );
-    showSearchResults(q, filtered, filtered.length);
+  grid.innerHTML = '<div class="loading">Загрузка…</div>';
+  let data;
+  try {
+    if (DEMO_MODE) {
+      const l = q ? DEMO_MOVIES.filter(m => (m.title + ' ' + m.original_title).toLowerCase().includes(q.toLowerCase())) : demoFilter();
+      data = { results: l, total_results: l.length, total_pages: 1, page: 1 };
+    } else {
+      data = q ? await tmdb('/search/movie', { query: q, page }) : await tmdb('/discover/movie', buildDiscoverParams());
+    }
+  } catch (e) {
+    if (my !== state.reqId) return;
+    console.error(e);
+    grid.innerHTML = '<div class="empty">Ошибка запроса: ' + escapeHtml(e.message) + '</div>';
     return;
   }
-  try {
-    const data = await tmdb('/search/movie', { query: q, page: 1 });
-    showSearchResults(q, data.results || [], data.total_results || 0);
-  } catch (e) {
-    console.error('search', e);
-  }
+  if (my !== state.reqId) return;
+
+  state.discoverTotalPages = Math.min(data.total_pages || 1, 500);
+  const total = (data.total_results || 0).toLocaleString('ru-RU');
+  $('#resultsCount').innerHTML = (q ? `Поиск «<b>${escapeHtml(q)}</b>»: ` : 'Найдено: ') +
+    `<b>${total}</b> · страница <b>${data.page || 1}</b> из <b>${state.discoverTotalPages}</b>`;
+
+  if (!data.results || !data.results.length) grid.innerHTML = '<div class="empty">Ничего не найдено</div>';
+  else { grid.innerHTML = data.results.map(movieCardHTML).join(''); attachCardClicks(grid); }
+  renderPagination();
 }
 
-function showSearchResults(q, results, total) {
-  state.discoverTotalPages = 1;
-  $('#resultsCount').innerHTML =
-    `Поиск «<b>${escapeHtml(q)}</b>»: <b>${total.toLocaleString('ru-RU')}</b> результатов`;
-  const grid = $('#discoverGrid');
-  if (!results.length) grid.innerHTML = '<div class="empty">Ничего не найдено</div>';
-  else {
-    grid.innerHTML = results.map(movieCardHTML).join('');
-    attachCardClicks(grid);
-  }
-  $('#pagination').innerHTML = '';
+function renderPagination() {
+  const cont = $('#pagination'), total = state.discoverTotalPages;
+  const cur = state.searchQuery ? state.searchPage : state.filters.page;
+  if (total <= 1) { cont.innerHTML = ''; return; }
 
-  $$('.tab').forEach(x => x.classList.remove('is-active'));
-  $$('.tab-panel').forEach(x => x.classList.remove('is-active'));
-  document.querySelector('.tab[data-tab="discover"]').classList.add('is-active');
-  $('#tab-discover').classList.add('is-active');
+  const list = [...new Set([1, total, cur - 2, cur - 1, cur, cur + 1, cur + 2])].filter(p => p >= 1 && p <= total).sort((a, b) => a - b);
+  let html = `<button data-page="${cur - 1}" ${cur === 1 ? 'disabled' : ''}>←</button>`, prev = 0;
+  for (const p of list) {
+    if (p - prev > 1) html += '<button disabled>…</button>';
+    html += `<button data-page="${p}" class="${p === cur ? 'is-active' : ''}">${p}</button>`;
+    prev = p;
+  }
+  html += `<button data-page="${cur + 1}" ${cur === total ? 'disabled' : ''}>→</button>`;
+  cont.innerHTML = html;
+
+  cont.querySelectorAll('button[data-page]').forEach(btn => btn.addEventListener('click', () => {
+    const p = Number(btn.dataset.page);
+    if (!p || p < 1 || p > total) return;
+    if (state.searchQuery) state.searchPage = p; else state.filters.page = p;
+    renderDiscover();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }));
 }
 
 function renderFiltersStrip() {
-  const f = state.filters;
-  const items = [];
-  if (f.genre) items.push(`Жанр: <b>${escapeHtml(genreName(Number(f.genre)))}</b>`);
-  if (f.yearFrom) items.push(`С <b>${f.yearFrom}</b>`);
-  if (f.yearTo)   items.push(`По <b>${f.yearTo}</b>`);
-  if (Number(f.rating) > 0) items.push(`Рейтинг ≥ <b>${f.rating}</b>`);
-  if (f.country) {
-    const c = state.countries.find(x => x.code === f.country);
-    items.push(`Страна: <b>${escapeHtml(c ? c.name : f.country)}</b>`);
-  }
-  $('#activeFilters').innerHTML = items.map(t => `<span class="badge">${t}</span>`).join('');
+  const f = state.filters, items = [];
+  if (state.searchQuery) items.push(['search', `Поиск: <b>${escapeHtml(state.searchQuery)}</b>`]);
+  if (f.genre) items.push(['genre', `Жанр: <b>${escapeHtml(genreName(+f.genre))}</b>`]);
+  if (f.yearFrom) items.push(['yearFrom', `С <b>${f.yearFrom}</b>`]);
+  if (f.yearTo) items.push(['yearTo', `По <b>${f.yearTo}</b>`]);
+  if (f.rating > 0) items.push(['rating', `Рейтинг ≥ <b>${f.rating}</b>`]);
+  if (f.country) items.push(['country', `Страна: <b>${escapeHtml(countryName(f.country))}</b>`]);
+  const strip = $('#activeFilters');
+  strip.innerHTML = items.map(([k, t]) => `<button class="badge" data-clear="${k}" title="Убрать">${t} ×</button>`).join('');
+  strip.querySelectorAll('[data-clear]').forEach(b => b.addEventListener('click', () => {
+    const k = b.dataset.clear;
+    if (k === 'search') { state.searchQuery = ''; $('#globalSearch').value = ''; }
+    else state.filters[k] = DEFAULT_FILTERS()[k];
+    state.filters.page = 1;
+    syncInputs(); renderDiscover(); renderFiltersStrip();
+  }));
 }
 
 /* =========================================================
-   ANALYTICS
+   ANALYTICS — строится по текущей выборке Discover / поиска
    ========================================================= */
-function drawDemoAnalytics() {
-  const ratings = {};
-  for (let i = 0; i <= 10; i += 0.5) ratings[i.toFixed(1)] = 0;
-  DEMO_MOVIES.forEach(m => {
-    const b = (Math.floor(m.vote_average * 2) / 2).toFixed(1);
-    if (ratings[b] !== undefined) ratings[b]++;
-  });
-  drawBar('chartRatings', Object.keys(ratings), Object.values(ratings), 'Фильмов');
-
-  const points = DEMO_MOVIES.map(m => ({ x: m.popularity, y: m.vote_average, label: m.title }));
-  drawScatter('chartScatter', points);
-
-  const topVotes = [...DEMO_MOVIES].sort((a,b) => b.vote_count - a.vote_count).slice(0,10);
-  drawBar('chartVotes', topVotes.map(m => m.title.slice(0,24)), topVotes.map(m => m.vote_count), 'Голосов', true);
-}
-
 async function renderAnalytics() {
-  if (DEMO_MODE) { drawDemoAnalytics(); return; }
-  if (!API_KEY) return;
-  try {
-    const pages = [1,2,3,4,5];
-    const results = await Promise.all(pages.map(p =>
-      tmdb('/discover/movie', { ...buildDiscoverParams(), page: p })
-        .then(r => r.results || []).catch(() => [])
-    ));
-    const flat = results.flat();
-    if (!flat.length) return;
-
-    const bins = {};
-    for (let i = 0; i <= 10; i += 0.5) bins[i.toFixed(1)] = 0;
-    flat.forEach(m => {
-      const b = (Math.floor((m.vote_average||0)*2)/2).toFixed(1);
-      if (bins[b] !== undefined) bins[b]++;
-    });
-    drawBar('chartRatings', Object.keys(bins), Object.values(bins), 'Фильмов');
-
-    const points = flat.filter(m => m.vote_average && m.popularity != null)
-      .map(m => ({ x: m.popularity, y: m.vote_average, label: m.title }));
-    drawScatter('chartScatter', points);
-
-    const topVotes = [...flat].sort((a,b) => (b.vote_count||0) - (a.vote_count||0)).slice(0,10);
-    drawBar('chartVotes', topVotes.map(m => (m.title||'').slice(0,24)), topVotes.map(m => m.vote_count||0), 'Голосов', true);
-  } catch (e) {
-    console.error('analytics', e);
+  const q = state.searchQuery;
+  let flat;
+  if (DEMO_MODE) flat = q ? DEMO_MOVIES.filter(m => (m.title + m.original_title).toLowerCase().includes(q.toLowerCase())) : demoFilter();
+  else {
+    const pages = await Promise.all([1, 2, 3, 4, 5].map(p =>
+      (q ? tmdb('/search/movie', { query: q, page: p }) : tmdb('/discover/movie', buildDiscoverParams(p)))
+        .then(r => r.results || []).catch(() => [])));
+    flat = pages.flat();
   }
+  $('#analyticsNote').textContent = flat.length
+    ? `Выборка: ${flat.length} фильмов (${q ? 'результаты поиска' : 'по текущим фильтрам Discover'})`
+    : 'Нет данных для текущих фильтров';
+  if (!flat.length) { ['chartRatings', 'chartScatter', 'chartVotes'].forEach(destroyChart); return; }
+
+  const bins = {};
+  for (let i = 0; i <= 10; i += 0.5) bins[i.toFixed(1)] = 0;
+  flat.filter(m => m.vote_average > 0).forEach(m => {
+    const b = (Math.floor(m.vote_average * 2) / 2).toFixed(1);
+    if (bins[b] !== undefined) bins[b]++;
+  });
+  drawBar('chartRatings', Object.keys(bins), Object.values(bins), 'Фильмов');
+
+  drawScatter('chartScatter', flat.filter(m => m.vote_average > 0 && m.popularity > 0)
+    .map(m => ({ x: m.popularity, y: m.vote_average, label: m.title })));
+
+  const topVotes = [...flat].sort((a, b) => (b.vote_count || 0) - (a.vote_count || 0)).slice(0, 10);
+  drawBar('chartVotes', topVotes.map(m => (m.title || '').slice(0, 24)), topVotes.map(m => m.vote_count || 0), 'Голосов', true);
 }
 
 /* =========================================================
@@ -943,7 +919,7 @@ function drawScatter(id, points) {
         }
       },
       scales: {
-        x: { title: { display: true, text: 'Популярность', color: '#8a8a86', font: CHART_FONT },
+        x: { type: 'logarithmic', title: { display: true, text: 'Популярность', color: '#8a8a86', font: CHART_FONT },
              ticks: { color: '#8a8a86', font: CHART_FONT }, grid: { color: '#1d1d1d' } },
         y: { title: { display: true, text: 'Рейтинг', color: '#8a8a86', font: CHART_FONT },
              ticks: { color: '#8a8a86', font: CHART_FONT }, grid: { color: '#1d1d1d' },
